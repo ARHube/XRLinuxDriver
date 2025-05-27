@@ -20,79 +20,77 @@
 #define VITURE_ONE_MODEL_NAME "One"
 #define VITURE_ONE_LITE_MODEL_NAME "One Lite"
 #define VITURE_PRO_MODEL_NAME "Pro"
+#define IMU_HISTORY_LEN 5
+
 const int viture_supported_id_product[VITURE_ID_PRODUCT_COUNT] = {
-    0x1011, // One
-    0x1013, // One
-    0x1017, // One
-    0x1015, // One Lite
-    0x101b, // One Lite
-    0x1019, // Pro
-    0x101d, // Pro
+    0x1011, 0x1013, 0x1017, 0x1015, 0x101b, 0x1019, 0x101d,
 };
+
 const char* viture_supported_models[VITURE_ID_PRODUCT_COUNT] = {
-    VITURE_ONE_MODEL_NAME, 
-    VITURE_ONE_MODEL_NAME,
-    VITURE_ONE_MODEL_NAME,
-    VITURE_ONE_LITE_MODEL_NAME,
-    VITURE_ONE_LITE_MODEL_NAME,
-    VITURE_PRO_MODEL_NAME,
-    VITURE_PRO_MODEL_NAME,
+    VITURE_ONE_MODEL_NAME, VITURE_ONE_MODEL_NAME, VITURE_ONE_MODEL_NAME,
+    VITURE_ONE_LITE_MODEL_NAME, VITURE_ONE_LITE_MODEL_NAME,
+    VITURE_PRO_MODEL_NAME, VITURE_PRO_MODEL_NAME,
 };
 
 const float VITURE_ONE_PITCH_ADJUSTMENT = 6.0;
 const float VITURE_PRO_PITCH_ADJUSTMENT = 3.0;
 static imu_quat_type adjustment_quat;
+static imu_quat_type imu_history[IMU_HISTORY_LEN];
+static int imu_history_index = 0;
 
-const device_properties_type viture_one_properties = {
-    .brand                              = "VITURE",
-    .model                              = "One",
-    .hid_vendor_id                      = 0x35ca,
-    .hid_product_id                     = 0x1011,
-    .calibration_setup                  = CALIBRATION_SETUP_AUTOMATIC,
-    .resolution_w                       = 1920,
-    .resolution_h                       = 1080,
-    .fov                                = 40.0,
-    .lens_distance_ratio                = 0.05,
-    .calibration_wait_s                 = 1,
-    .imu_cycles_per_s                   = 60,
-    .imu_buffer_size                    = 1,
-    .look_ahead_constant                = 20.0,
-    .look_ahead_frametime_multiplier    = 0.6,
-    .look_ahead_scanline_adjust         = 10.0,
-    .look_ahead_ms_cap                  = 40.0,
-    .sbs_mode_supported                 = true,
-    .firmware_update_recommended        = false
-};
+static imu_quat_type slerp(imu_quat_type q1, imu_quat_type q2, float t) {
+    float dot = q1.x*q2.x + q1.y*q2.y + q1.z*q2.z + q1.w*q2.w;
+    if (dot < 0.0f) {
+        q2.x = -q2.x; q2.y = -q2.y; q2.z = -q2.z; q2.w = -q2.w;
+        dot = -dot;
+    }
+    if (dot > 0.9995f) {
+        imu_quat_type result = {
+            .x = q1.x + t*(q2.x - q1.x),
+            .y = q1.y + t*(q2.y - q1.y),
+            .z = q1.z + t*(q2.z - q1.z),
+            .w = q1.w + t*(q2.w - q1.w)
+        };
+        float norm = sqrtf(result.x*result.x + result.y*result.y + result.z*result.z + result.w*result.w);
+        result.x /= norm; result.y /= norm; result.z /= norm; result.w /= norm;
+        return result;
+    }
+    float theta_0 = acosf(dot);
+    float sin_theta_0 = sinf(theta_0);
+    float theta = theta_0 * t;
+    float sin_theta = sinf(theta);
 
-const int frequency_enum_to_value[] = {
-    [IMU_FREQUENCE_60] = 60,
-    [IMU_FREQUENCE_90] = 90,
-    [IMU_FREQUENCE_120] = 120,
-    [IMU_FREQUENCE_240] = 240
-};
+    float s1 = cosf(theta) - dot * sin_theta / sin_theta_0;
+    float s2 = sin_theta / sin_theta_0;
 
-const char* frequency_to_string[] = {
-    [IMU_FREQUENCE_60] = "60Hz",
-    [IMU_FREQUENCE_90] = "90Hz",
-    [IMU_FREQUENCE_120] = "120Hz",
-    [IMU_FREQUENCE_240] = "240Hz"
-};
+    imu_quat_type result = {
+        .x = s1*q1.x + s2*q2.x,
+        .y = s1*q1.y + s2*q2.y,
+        .z = s1*q1.z + s2*q2.z,
+        .w = s1*q1.w + s2*q2.w
+    };
+    return result;
+}
 
-static float float_from_imu_data(uint8_t *data)
-{
-	float value = 0;
-	uint8_t tem[4];
-	tem[0] = data[3];
-	tem[1] = data[2];
-	tem[2] = data[1];
-	tem[3] = data[0];
-	memcpy(&value, tem, 4);
-	return value;
+static imu_quat_type slerp_average() {
+    imu_quat_type result = imu_history[0];
+    for (int i = 1; i < IMU_HISTORY_LEN; ++i) {
+        result = slerp(result, imu_history[i], 1.0f / (i + 1));
+    }
+    return result;
+}
+
+static float float_from_imu_data(uint8_t *data) {
+    float value = 0;
+    uint8_t tem[4] = { data[3], data[2], data[1], data[0] };
+    memcpy(&value, tem, 4);
+    return value;
 }
 
 static bool old_firmware_version = true;
 static bool connected = false;
 static bool initialized = false;
+
 void handle_viture_event(uint8_t *data, uint16_t len, uint32_t timestamp) {
     if (!connected || driver_disabled()) return;
 
@@ -106,18 +104,16 @@ void handle_viture_event(uint8_t *data, uint16_t len, uint32_t timestamp) {
         float euler_roll = float_from_imu_data(data);
         float euler_pitch = float_from_imu_data(data + 4);
         float euler_yaw = float_from_imu_data(data + 8);
-
-        imu_euler_type euler = {
-            .roll = euler_roll,
-            .pitch = euler_pitch,
-            .yaw = euler_yaw
-        };
+        imu_euler_type euler = { .roll = euler_roll, .pitch = euler_pitch, .yaw = euler_yaw };
         quat = euler_to_quaternion_zxy(euler);
     }
 
     quat = multiply_quaternions(quat, adjustment_quat);
+    imu_history[imu_history_index % IMU_HISTORY_LEN] = quat;
+    imu_history_index++;
 
-    driver_handle_imu_event(timestamp, quat);
+    imu_quat_type smoothed = slerp_average();
+    driver_handle_imu_event(timestamp, smoothed);
 }
 
 bool sbs_mode_enabled = false;
